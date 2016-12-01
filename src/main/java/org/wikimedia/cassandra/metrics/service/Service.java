@@ -47,6 +47,9 @@ import com.github.rvesse.airline.Option;
 import com.github.rvesse.airline.SingleCommand;
 import com.github.rvesse.airline.parser.ParseException;
 
+import javax.management.remote.JMXServiceURL;
+import org.wikimedia.cassandra.metrics.Discovery.Jvm;
+
 @Command(name = "cmcd", description = "cassandra-metrics-collector daemon")
 public class Service {
 
@@ -72,6 +75,15 @@ public class Service {
     @Option(name = {"-f", "--filter-config"}, description = "Metric filter configuration", title = "YAML")
     private String filterConfig = null;
 
+    @Option(name = {"-c", "--cassandra-host"}, description = "Cassandra instance to poll", title = "INSTANCE")
+    private String cassandraInstance = null;
+
+    @Option(name = {"-j", "--cassandra-jmx-port"}, description = "Cassandra instance JMX port (default: 7119)", title = "JMXPORT")
+    private int jmxPort = 7199;
+
+    @Option(name = {"-P", "--prefix"}, description = "Prefix to use in adhoc mode", title = "PREFIX")
+    private String prefix = "cassandra";
+
     private InstanceCache state = new InstanceCache();
 
     Filter getFilter() throws FileNotFoundException, IOException {
@@ -85,6 +97,18 @@ public class Service {
         return null;
     }
 
+   private static Trigger createTrigger(String instance, int interval) {
+        return newTrigger()
+                .withIdentity(triggerName(instance), "collectionGroup")
+                .startNow()
+                .withSchedule(simpleSchedule().withIntervalInSeconds(interval).repeatForever())
+                .build();
+    }
+
+    private static String triggerName(String instance) {
+        return String.format("%s_Trigger", instance);
+    }
+
     void execute() throws SchedulerException, IOException {
 
         // Print a synopsis to STDOUT (if requested), and exit.
@@ -96,38 +120,57 @@ public class Service {
 
         Scheduler scheduler = StdSchedulerFactory.getDefaultScheduler();
 
-        // Triggers periodic (re)discovery
-        Trigger discoveryTrigger = newTrigger()
-                .withIdentity("discoveryTrigger", "discoveryGroup")
-                .startNow()
-                .withSchedule(simpleSchedule().withIntervalInSeconds(discoverInterval).repeatForever())
-                .build();
-
         // Triggers reporting of internal metrics
         Trigger reportTrigger = newTrigger()
                 .withIdentity("reportTrigger", "reportGroup")
                 .startNow()
                 .withSchedule(simpleSchedule().withIntervalInSeconds(interval).repeatForever())
                 .build();
-        
+
         // Setup discovery.
+        if (cassandraInstance == null) {
+            // Triggers periodic (re)discovery
+            Trigger discoveryTrigger = newTrigger()
+                    .withIdentity("discoveryTrigger", "discoveryGroup")
+                    .startNow()
+                    .withSchedule(simpleSchedule().withIntervalInSeconds(discoverInterval).repeatForever())
+                    .build();
 
-        // The discovery job periodically looks for new instances, and schedules
-        // recurring collection tasks for any it finds.
-        JobDataMap discoverMap = new JobDataMap();
-        discoverMap.put("instances", state);
-        discoverMap.put("scheduler", scheduler);
-        discoverMap.put("interval", interval);
-        discoverMap.put("carbonHost", carbonHost);
-        discoverMap.put("carbonPort", carbonPort);
-        discoverMap.put("filter", getFilter());
+            // The discovery job periodically looks for new instances, and schedules
+            // recurring collection tasks for any it finds.
+            JobDataMap discoverMap = new JobDataMap();
+            discoverMap.put("instances", state);
+            discoverMap.put("scheduler", scheduler);
+            discoverMap.put("interval", interval);
+            discoverMap.put("carbonHost", carbonHost);
+            discoverMap.put("carbonPort", carbonPort);
+            discoverMap.put("filter", getFilter());
 
-        JobDetail discoverJob = newJob(Discover.class)
-                .withIdentity("discoveryJob", "discoveryGroup")
-                .usingJobData(discoverMap)
-                .build();
+            JobDetail discoverJob = newJob(Discover.class)
+                    .withIdentity("discoveryJob", "discoveryGroup")
+                    .usingJobData(discoverMap)
+                    .build();
 
-        scheduler.scheduleJob(discoverJob, discoveryTrigger);
+            scheduler.scheduleJob(discoverJob, discoveryTrigger);
+        } else {
+            LOG.info("Adhoc mode - service:jmx:rmi:///jndi/rmi://" + cassandraInstance + ":" + jmxPort + "/jmxrmi");
+            Jvm jvm = new Jvm(prefix, new JMXServiceURL("service:jmx:rmi:///jndi/rmi://" + cassandraInstance + ":" + jmxPort + "/jmxrmi"));
+
+            JobDataMap dataMap = new JobDataMap();
+            dataMap.put("jvm", jvm);
+            dataMap.put("carbonHost", carbonHost);
+            dataMap.put("carbonPort", carbonPort);
+            dataMap.put("instanceName", jvm.getCassandraInstance());
+            dataMap.put("filter", getFilter());
+            dataMap.put("interval", interval);
+
+            JobDetail job = newJob(Collector.class)
+                    .withIdentity(jvm.getCassandraInstance(), "collectionGroup")
+                    .usingJobData(dataMap)
+                    .build();
+            LOG.info("Scheduling recurring metrics collection for {} every {}", jvm.getCassandraInstance(), this.interval);
+            scheduler.scheduleJob(job, createTrigger(jvm.getCassandraInstance(), this.interval));
+        }
 
         // The collection listener monitors for task completion in the collection
         // group, and updates the stats counters accordingly.
